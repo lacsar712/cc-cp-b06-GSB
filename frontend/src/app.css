@@ -134,3 +134,29 @@ td {
   font-size: 0.875rem;
   color: #475569;
 }
+
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+button.tab {
+  background: #e2e8f0;
+  color: #334155;
+  border-radius: 6px;
+}
+
+button.tab.active {
+  background: #0369a1;
+  color: #fff;
+}
+
+button.danger {
+  background: #b91c1c;
+}
+
+.tag.retired {
+  background: #e2e8f0;
+  color: #334155;
+}

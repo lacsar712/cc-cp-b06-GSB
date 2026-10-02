@@ -23,6 +23,29 @@ CREATE TABLE IF NOT EXISTS probe_readings (
     processed_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS idx_probe_readings_status ON probe_readings (status, id);
+
+-- 探头在役/退役状态。每个探头代号一行，行锁用于串行化退役与读数提交。
+CREATE TABLE IF NOT EXISTS probe_states (
+    probe_id text PRIMARY KEY,
+    state text NOT NULL DEFAULT 'active',
+    updated_by text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT probe_states_state_chk CHECK (state IN ('active', 'retired'))
+);
+
+-- 退役/恢复流水
+CREATE TABLE IF NOT EXISTS probe_state_events (
+    id serial PRIMARY KEY,
+    probe_id text NOT NULL,
+    action text NOT NULL,
+    operator text NOT NULL,
+    note text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT probe_state_events_action_chk CHECK (action IN ('retire', 'restore'))
+);
+CREATE INDEX IF NOT EXISTS idx_probe_state_events_probe
+    ON probe_state_events (probe_id, id);
 """
 
 

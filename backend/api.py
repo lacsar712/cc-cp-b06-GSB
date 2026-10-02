@@ -50,7 +50,7 @@ def require_writer(request: web.Request) -> dict:
     user = require_user(request)
     if user["role"] != "writer":
         raise web.HTTPForbidden(
-            text=json.dumps({"detail": "仅记录员可提交读数"}, ensure_ascii=False),
+            text=json.dumps({"detail": "仅记录员可执行此操作"}, ensure_ascii=False),
             content_type="application/json",
         )
     return user
@@ -133,16 +133,46 @@ async def create_reading(request: web.Request) -> web.Response:
         ) from exc
 
     pool: asyncpg.Pool = request.app["pool"]
-    row = await pool.fetchrow(
-        """
-        INSERT INTO probe_readings (probe_id, temp_c, status, created_by, created_at)
-        VALUES ($1, $2, 'pending', $3, now())
-        RETURNING id, probe_id, temp_c, verdict, reason, status, created_by, created_at, processed_at
-        """,
-        probe_id,
-        temp_c,
-        user["username"],
-    )
+    async with pool.acquire() as conn:
+        # 与退役操作串行化：先确保该代号的状态行存在（顺带拿到行锁），
+        # 再在同一事务内复查退役态并插入读数。
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO probe_states (probe_id, state, updated_by)
+                VALUES ($1, 'active', $2)
+                ON CONFLICT (probe_id) DO NOTHING
+                """,
+                probe_id,
+                user["username"],
+            )
+            state_row = await conn.fetchrow(
+                "SELECT state FROM probe_states WHERE probe_id = $1 FOR UPDATE",
+                probe_id,
+            )
+            if state_row and state_row["state"] == "retired":
+                raise web.HTTPConflict(
+                    text=json.dumps(
+                        {
+                            "detail": (
+                                f"探头 {probe_id} 已退役封存，禁止再提交新温度；"
+                                "恢复在役后才允许继续提交。"
+                            )
+                        },
+                        ensure_ascii=False,
+                    ),
+                    content_type="application/json",
+                )
+            row = await conn.fetchrow(
+                """
+                INSERT INTO probe_readings (probe_id, temp_c, status, created_by, created_at)
+                VALUES ($1, $2, 'pending', $3, now())
+                RETURNING id, probe_id, temp_c, verdict, reason, status, created_by, created_at, processed_at
+                """,
+                probe_id,
+                temp_c,
+                user["username"],
+            )
     return web.json_response(
         {
             "id": row["id"],
@@ -158,6 +188,138 @@ async def create_reading(request: web.Request) -> web.Response:
         },
         status=201,
     )
+
+
+def _probe_state_json(r) -> dict:
+    return {
+        "probe_id": r["probe_id"],
+        "state": r["state"],
+        "updated_by": r["updated_by"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+    }
+
+
+def _event_json(r) -> dict:
+    return {
+        "id": r["id"],
+        "probe_id": r["probe_id"],
+        "action": r["action"],
+        "operator": r["operator"],
+        "note": r["note"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+    }
+
+
+async def list_probes(request: web.Request) -> web.Response:
+    require_user(request)
+    pool: asyncpg.Pool = request.app["pool"]
+    rows = await pool.fetch(
+        """
+        SELECT p.probe_id,
+               COALESCE(s.state, 'active') AS state,
+               s.updated_by,
+               s.created_at,
+               s.updated_at
+        FROM (
+            SELECT DISTINCT probe_id FROM probe_readings
+            UNION
+            SELECT probe_id FROM probe_states
+        ) p
+        LEFT JOIN probe_states s ON s.probe_id = p.probe_id
+        ORDER BY p.probe_id
+        """
+    )
+    return web.json_response([_probe_state_json(r) for r in rows])
+
+
+async def list_probe_events(request: web.Request) -> web.Response:
+    require_user(request)
+    pool: asyncpg.Pool = request.app["pool"]
+    rows = await pool.fetch(
+        """
+        SELECT id, probe_id, action, operator, note, created_at
+        FROM probe_state_events
+        ORDER BY id DESC
+        """
+    )
+    return web.json_response([_event_json(r) for r in rows])
+
+
+async def _change_probe_state(request: web.Request, *, action: str) -> web.Response:
+    user = require_writer(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise web.HTTPBadRequest(text="invalid json") from exc
+    probe_id = str(body.get("probe_id", "")).strip() if isinstance(body, dict) else ""
+    if not probe_id:
+        raise web.HTTPBadRequest(
+            text=json.dumps({"detail": "探头编号不能为空"}, ensure_ascii=False),
+            content_type="application/json",
+        )
+    note = str(body.get("note", "")).strip() if isinstance(body, dict) else ""
+
+    if action == "retire":
+        to_state, already_msg = "retired", "已退役封存，无需重复退役"
+    else:
+        to_state, already_msg = "active", "未处于退役状态，无需恢复"
+
+    pool: asyncpg.Pool = request.app["pool"]
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # 与读数提交同一套串行化手段：先确保状态行存在，再对其加行锁后复查。
+            await conn.execute(
+                """
+                INSERT INTO probe_states (probe_id, state, updated_by)
+                VALUES ($1, 'active', $2)
+                ON CONFLICT (probe_id) DO NOTHING
+                """,
+                probe_id,
+                user["username"],
+            )
+            cur = await conn.fetchrow(
+                "SELECT state FROM probe_states WHERE probe_id = $1 FOR UPDATE",
+                probe_id,
+            )
+            if cur is not None and cur["state"] == to_state:
+                raise web.HTTPConflict(
+                    text=json.dumps(
+                        {"detail": f"探头 {probe_id} {already_msg}"},
+                        ensure_ascii=False,
+                    ),
+                    content_type="application/json",
+                )
+            row = await conn.fetchrow(
+                """
+                UPDATE probe_states
+                SET state = $2, updated_by = $3, updated_at = now()
+                WHERE probe_id = $1
+                RETURNING probe_id, state, updated_by, created_at, updated_at
+                """,
+                probe_id,
+                to_state,
+                user["username"],
+            )
+            await conn.execute(
+                """
+                INSERT INTO probe_state_events (probe_id, action, operator, note)
+                VALUES ($1, $2, $3, $4)
+                """,
+                probe_id,
+                action,
+                user["username"],
+                note or None,
+            )
+    return web.json_response(_probe_state_json(row))
+
+
+async def retire_probe(request: web.Request) -> web.Response:
+    return await _change_probe_state(request, action="retire")
+
+
+async def restore_probe(request: web.Request) -> web.Response:
+    return await _change_probe_state(request, action="restore")
 
 
 async def on_startup(app: web.Application) -> None:
@@ -179,6 +341,10 @@ def create_app() -> web.Application:
     app.router.add_post("/api/auth/login", login)
     app.router.add_get("/api/readings", list_readings)
     app.router.add_post("/api/readings", create_reading)
+    app.router.add_get("/api/probes", list_probes)
+    app.router.add_get("/api/probe-events", list_probe_events)
+    app.router.add_post("/api/probes/retire", retire_probe)
+    app.router.add_post("/api/probes/restore", restore_probe)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
