@@ -17,6 +17,16 @@ function displayVerdict(row) {
   return "—";
 }
 
+function fmtTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(
+    d.getHours()
+  )}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 export function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY));
   const [user, setUser] = useState(() => {
@@ -26,12 +36,16 @@ export function App() {
       return null;
     }
   });
+  const [view, setView] = useState("readings");
   const [loginForm, setLoginForm] = useState({ username: "logger", password: "log123456" });
   const [submitForm, setSubmitForm] = useState({ probe_id: "", temp_c: "" });
   const [rows, setRows] = useState([]);
+  const [probes, setProbes] = useState([]);
+  const [events, setEvents] = useState([]);
   const [error, setError] = useState("");
   const [msg, setMsg] = useState("");
   const [loading, setLoading] = useState(false);
+  const [actingId, setActingId] = useState("");
 
   const authHeaders = useCallback(() => {
     const h = { "Content-Type": "application/json" };
@@ -39,22 +53,27 @@ export function App() {
     return h;
   }, [token]);
 
-  const loadReadings = useCallback(async () => {
-    if (!token) return;
-    const res = await fetch("/api/readings", { headers: authHeaders() });
-    if (!res.ok) {
-      setError("加载列表失败，请重新登录");
+  const loadAll = useCallback(async () => {
+    const [rRes, pRes, eRes] = await Promise.all([
+      fetch("/api/readings", { headers: authHeaders() }),
+      fetch("/api/probes", { headers: authHeaders() }),
+      fetch("/api/probe-events", { headers: authHeaders() }),
+    ]);
+    if (!rRes.ok || !pRes.ok || !eRes.ok) {
+      setError("加载数据失败，请重新登录");
       return;
     }
-    setRows(await res.json());
-  }, [token, authHeaders]);
+    setRows(await rRes.json());
+    setProbes(await pRes.json());
+    setEvents(await eRes.json());
+  }, [authHeaders]);
 
   useEffect(() => {
-    loadReadings();
     if (!token) return undefined;
-    const t = setInterval(loadReadings, 3000);
+    loadAll();
+    const t = setInterval(loadAll, 3000);
     return () => clearInterval(t);
-  }, [loadReadings, token]);
+  }, [loadAll, token]);
 
   async function onLogin(e) {
     e.preventDefault();
@@ -78,6 +97,7 @@ export function App() {
       );
       setToken(data.access_token);
       setUser({ username: data.username, role: data.role });
+      setView("readings");
     } finally {
       setLoading(false);
     }
@@ -89,6 +109,8 @@ export function App() {
     setToken(null);
     setUser(null);
     setRows([]);
+    setProbes([]);
+    setEvents([]);
   }
 
   async function onSubmit(e) {
@@ -112,9 +134,31 @@ export function App() {
       }
       setMsg(data.message || "已提交");
       setSubmitForm({ probe_id: "", temp_c: "" });
-      await loadReadings();
+      await loadAll();
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function changeProbeStatus(probeId, action) {
+    setError("");
+    setMsg("");
+    setActingId(`${action}:${probeId}`);
+    try {
+      const res = await fetch(`/api/probes/${action}`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ probe_id: probeId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.detail || "操作失败");
+        return;
+      }
+      setMsg(data.message || (action === "retire" ? "已退役封存" : "已恢复在役"));
+      await loadAll();
+    } finally {
+      setActingId("");
     }
   }
 
@@ -160,6 +204,8 @@ export function App() {
   }
 
   const isWriter = user?.role === "writer";
+  const activeProbes = probes.filter((p) => p.status === "active");
+  const retiredProbes = probes.filter((p) => p.status === "retired");
 
   return (
     <div class="wrap">
@@ -169,6 +215,30 @@ export function App() {
           <p class="sub">温度不超过 8℃ 为合格，否则为超温。</p>
         </div>
         <div class="user">
+          <nav class="nav">
+            <button
+              type="button"
+              class={view === "readings" ? "navbtn on" : "navbtn"}
+              onClick={() => {
+                setView("readings");
+                setError("");
+                setMsg("");
+              }}
+            >
+              读数台
+            </button>
+            <button
+              type="button"
+              class={view === "retire" ? "navbtn on" : "navbtn"}
+              onClick={() => {
+                setView("retire");
+                setError("");
+                setMsg("");
+              }}
+            >
+              退役管理
+            </button>
+          </nav>
           {user?.username}（{isWriter ? "记录员" : "值班员"}）
           <button type="button" class="secondary" style={{ marginLeft: "0.5rem" }} onClick={logout}>
             退出
@@ -176,82 +246,226 @@ export function App() {
         </div>
       </div>
 
-      {isWriter && (
+      {error && <p class="err banner">{error}</p>}
+      {msg && <p class="ok banner">{msg}</p>}
+
+      {view === "readings" && (
         <div class="card">
-          <h2 style={{ marginTop: 0, fontSize: "1.1rem" }}>提交读数</h2>
-          <form onSubmit={onSubmit}>
-            <div class="row">
-              <label>
-                探头编号
-                <input
-                  required
-                  value={submitForm.probe_id}
-                  onInput={(e) =>
-                    setSubmitForm({ ...submitForm, probe_id: e.target.value })
-                  }
-                  placeholder="例如 探头C03"
-                />
-              </label>
-              <label>
-                温度（℃）
-                <input
-                  required
-                  type="number"
-                  step="0.1"
-                  value={submitForm.temp_c}
-                  onInput={(e) =>
-                    setSubmitForm({ ...submitForm, temp_c: e.target.value })
-                  }
-                />
-              </label>
-              <button type="submit" disabled={loading}>
-                提交
-              </button>
-            </div>
-            {error && <p class="err">{error}</p>}
-            {msg && <p class="ok">{msg}</p>}
-          </form>
+          {isWriter ? (
+            <form onSubmit={onSubmit}>
+              <h2 style={{ marginTop: 0, fontSize: "1.1rem" }}>提交读数</h2>
+              <div class="row">
+                <label>
+                  探头编号
+                  <input
+                    required
+                    value={submitForm.probe_id}
+                    onInput={(e) =>
+                      setSubmitForm({ ...submitForm, probe_id: e.target.value })
+                    }
+                    placeholder="例如 探头C03"
+                  />
+                </label>
+                <label>
+                  温度（℃）
+                  <input
+                    required
+                    type="number"
+                    step="0.1"
+                    value={submitForm.temp_c}
+                    onInput={(e) =>
+                      setSubmitForm({ ...submitForm, temp_c: e.target.value })
+                    }
+                  />
+                </label>
+                <button type="submit" disabled={loading}>
+                  提交
+                </button>
+              </div>
+              <p class="sub" style={{ marginBottom: 0, marginTop: "0.5rem", fontSize: "0.8rem" }}>
+                已退役封存的探头禁止再交新温，须先在「退役管理」恢复在役。
+              </p>
+            </form>
+          ) : (
+            <p class="sub" style={{ margin: 0 }}>值班员为只读账号，仅可查看读数。</p>
+          )}
         </div>
       )}
 
-      <div class="card">
-        <h2 style={{ marginTop: 0, fontSize: "1.1rem" }}>读数列表</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>编号</th>
-              <th>探头</th>
-              <th>温度℃</th>
-              <th>结论</th>
-              <th>说明</th>
-              <th>状态</th>
-              <th>提交人</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r.id}>
-                <td>{r.id}</td>
-                <td>{r.probe_id}</td>
-                <td>{r.temp_c}</td>
-                <td>
-                  <span class={verdictClass(r.verdict, r.status)}>
-                    {displayVerdict(r)}
-                  </span>
-                </td>
-                <td>{r.reason || "—"}</td>
-                <td>{r.status}</td>
-                <td>{r.created_by}</td>
-              </tr>
-            ))}
-            {rows.length === 0 && (
+      {view === "readings" && (
+        <div class="card">
+          <h2 style={{ marginTop: 0, fontSize: "1.1rem" }}>读数列表</h2>
+          <table>
+            <thead>
               <tr>
-                <td colspan="7">暂无数据</td>
+                <th>编号</th>
+                <th>探头</th>
+                <th>温度℃</th>
+                <th>结论</th>
+                <th>说明</th>
+                <th>状态</th>
+                <th>提交人</th>
               </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id}>
+                  <td>{r.id}</td>
+                  <td>{r.probe_id}</td>
+                  <td>{r.temp_c}</td>
+                  <td>
+                    <span class={verdictClass(r.verdict, r.status)}>
+                      {displayVerdict(r)}
+                    </span>
+                  </td>
+                  <td>{r.reason || "—"}</td>
+                  <td>{r.status}</td>
+                  <td>{r.created_by}</td>
+                </tr>
+              ))}
+              {rows.length === 0 && (
+                <tr>
+                  <td colspan="7">暂无数据</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {view === "retire" && (
+        <>
+          <div class="card">
+            <h2 style={{ marginTop: 0, fontSize: "1.1rem" }}>
+              在役探头
+              <span class="muted">（{activeProbes.length}）</span>
+            </h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>探头代号</th>
+                  <th>状态</th>
+                  <th>读数条数</th>
+                  <th>最近交温</th>
+                  {isWriter && <th>操作</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {activeProbes.map((p) => (
+                  <tr key={p.probe_id}>
+                    <td>{p.probe_id}</td>
+                    <td><span class="tag pass">在役</span></td>
+                    <td>{p.readings_count}</td>
+                    <td>{fmtTime(p.last_reading_at)}</td>
+                    {isWriter && (
+                      <td>
+                        <button
+                          type="button"
+                          class="danger"
+                          disabled={actingId !== ""}
+                          onClick={() => changeProbeStatus(p.probe_id, "retire")}
+                        >
+                          退役封存
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+                {activeProbes.length === 0 && (
+                  <tr>
+                    <td colspan={isWriter ? 5 : 4}>暂无在役探头</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h2 style={{ marginTop: 0, fontSize: "1.1rem" }}>
+              已退役探头
+              <span class="muted">（{retiredProbes.length}）</span>
+            </h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>探头代号</th>
+                  <th>状态</th>
+                  <th>退役时间</th>
+                  <th>读数条数</th>
+                  {isWriter && <th>操作</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {retiredProbes.map((p) => (
+                  <tr key={p.probe_id}>
+                    <td>{p.probe_id}</td>
+                    <td><span class="tag fail">已退役</span></td>
+                    <td>{fmtTime(p.retired_at)}</td>
+                    <td>{p.readings_count}</td>
+                    {isWriter && (
+                      <td>
+                        <button
+                          type="button"
+                          class="secondary"
+                          disabled={actingId !== ""}
+                          onClick={() => changeProbeStatus(p.probe_id, "restore")}
+                        >
+                          恢复在役
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+                {retiredProbes.length === 0 && (
+                  <tr>
+                    <td colspan={isWriter ? 5 : 4}>暂无退役探头</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+            {!isWriter && (
+              <p class="sub" style={{ marginBottom: 0, fontSize: "0.8rem" }}>
+                值班员只读：退役与恢复操作仅记录员可执行。
+              </p>
             )}
-          </tbody>
-        </table>
-      </div>
+          </div>
+
+          <div class="card">
+            <h2 style={{ marginTop: 0, fontSize: "1.1rem" }}>退役流水</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>流水号</th>
+                  <th>探头代号</th>
+                  <th>动作</th>
+                  <th>操作人</th>
+                  <th>时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                {events.map((ev) => (
+                  <tr key={ev.id}>
+                    <td>{ev.id}</td>
+                    <td>{ev.probe_id}</td>
+                    <td>
+                      <span class={ev.action === "retire" ? "tag fail" : "tag pass"}>
+                        {ev.action === "retire" ? "退役封存" : "恢复在役"}
+                      </span>
+                    </td>
+                    <td>{ev.operator}</td>
+                    <td>{fmtTime(ev.created_at)}</td>
+                  </tr>
+                ))}
+                {events.length === 0 && (
+                  <tr>
+                    <td colspan="5">暂无退役流水</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
     </div>
   );
 }
